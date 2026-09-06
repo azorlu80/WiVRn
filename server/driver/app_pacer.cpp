@@ -33,6 +33,12 @@ DEBUG_GET_ONCE_FLOAT_OPTION(min_margin_ms, "U_PACING_APP_MIN_MARGIN_MS", 1.5f)
 namespace wivrn
 {
 
+static constexpr float pacing_filter_coefficient = 0.1f;
+
+// A tight, realistic ceiling for frame-timing metrics on modern hardware.
+// This prevents fake driver-side fence/signal latencies (NVIDIA) from inflating the pacer's averages.
+static constexpr int64_t max_pacing_overhead_ns = U_TIME_1MS_IN_NS * 1.5; // 1.5ms
+
 class app_pacer : public u_pacing_app
 {
 	pacing_app_factory & parent;
@@ -133,13 +139,37 @@ void app_pacer::predict(int64_t now_ns,
 	get_frame(frame_id) = {.frame_id = frame_id};
 
 	// no need to lock, called in same thread as writes
-	auto min_ready = now_ns + cpu_time + gpu_time + compositor_time;
+	// Clamp pacing metrics for the "app too slow" checks: prevents fake inflated NVIDIA GPU
+	// times from triggering the frame-skipping branches (issue #873); real render times are
+	// still measured/reported elsewhere.
+	int64_t max_padding = period - int64_t(U_TIME_1MS_IN_NS * min_margin_ms.val) - U_TIME_1MS_IN_NS;
+	int64_t clamped_cpu = std::min(cpu_time, period - U_TIME_1MS_IN_NS);
+	int64_t clamped_gpu = std::min(gpu_time, period - U_TIME_1MS_IN_NS);
+	auto min_ready = now_ns + (max_padding > 0 ? std::min(clamped_cpu + clamped_gpu + compositor_time, max_padding) : int64_t(0));
+
 	// The ideal display time: one frame after the last
 	last_display_time += period;
-	// Sync phase with compositor
-	last_display_time = compositor_display_time + period * ((period / 2 + last_display_time - compositor_display_time) / period);
 
-	if (cpu_time > period or gpu_time > period or (min_ready > last_display_time and min_ready < last_display_time + period))
+	// Smooth Phase-Locked Loop (PLL) to prevent pacing-aliasing/beating near the frame boundary
+	int64_t diff = last_display_time - compositor_display_time;
+	if (std::abs(diff) > period * 2)
+	{
+		// Major desync (startup/loading): snap instantly, handle negative division truncation
+		int64_t quotient = (diff >= 0) ? (diff + period / 2) / period
+		                               : (diff - period / 2) / period;
+		last_display_time = compositor_display_time + period * quotient;
+	}
+	else
+	{
+		// Normal running: adjust slowly (1/10th of the error) to filter jitter
+		int64_t d = (period / 2 + diff) % period;
+		if (d < 0)
+			d += period;
+		d -= period / 2;
+		last_display_time -= d / 10;
+	}
+
+	if (clamped_cpu > period or clamped_gpu > period or (min_ready > last_display_time and min_ready < last_display_time + period))
 	{
 		// We are limited by app time, don't wait
 		*out_wake_up_time = now_ns;
@@ -156,7 +186,7 @@ void app_pacer::predict(int64_t now_ns,
 
 		*out_predicted_display_time = last_display_time;
 		*out_predicted_display_period = period;
-		*out_wake_up_time = last_display_time - (cpu_time + gpu_time + compositor_time + int64_t(U_TIME_1MS_IN_NS * min_margin_ms.val));
+		*out_wake_up_time = last_display_time - (clamped_cpu + clamped_gpu + compositor_time + int64_t(U_TIME_1MS_IN_NS * min_margin_ms.val));
 	}
 }
 
@@ -215,9 +245,14 @@ void app_pacer::mark_gpu_done(int64_t frame_id, int64_t when_ns)
 	if (frame.frame_id != frame_id or not(frame.wake_up and frame.delivered))
 		return;
 
+	// Clamp raw CPU/GPU times to a tight realistic ceiling so fake driver-side fence latency
+	// (NVIDIA, issue #873) can't inflate the rolling averages and trigger false frame drops.
+	int64_t raw_cpu = std::min(frame.delivered - frame.wake_up, max_pacing_overhead_ns);
+	int64_t raw_gpu = std::min(when_ns - frame.delivered, max_pacing_overhead_ns);
+
 	std::lock_guard lock(mutex);
-	cpu_time = lerp0(cpu_time, std::min(3 * period, frame.delivered - frame.wake_up), 0.1);
-	gpu_time = lerp0(gpu_time, std::min(3 * period, when_ns - frame.delivered), 0.1);
+	cpu_time = lerp0(cpu_time, std::max<int64_t>(U_TIME_1MS_IN_NS, raw_cpu), pacing_filter_coefficient);
+	gpu_time = lerp0(gpu_time, std::max<int64_t>(U_TIME_1MS_IN_NS, raw_gpu), pacing_filter_coefficient);
 }
 
 pacing_app_factory::pacing_app_factory() :

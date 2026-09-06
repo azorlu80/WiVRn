@@ -296,7 +296,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		        }
 		                .get(),
 		        VmaAllocationCreateInfo{
-		                .usage = VMA_MEMORY_USAGE_AUTO,
+		                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
 		        },
 		        std::format("vulkan encoder {} temporary image", stream_idx));
 
@@ -358,7 +358,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		        vk.device,
 		        img_create_info,
 		        {
-		                .usage = VMA_MEMORY_USAGE_AUTO,
+		                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
 		        },
 		        std::format("vulkan encoder {} DPB image", stream_idx));
 	}
@@ -379,7 +379,7 @@ void wivrn::video_encoder_vulkan::init(const vk::VideoCapabilitiesKHR & video_ca
 		        },
 		        {
 		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT,
-		                .usage = VMA_MEMORY_USAGE_AUTO,
+		                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
 		        },
 		        std::format("vulkan encode {} output buffer {}", stream_idx, i));
 
